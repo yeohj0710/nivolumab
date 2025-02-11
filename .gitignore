@@ -1,0 +1,6 @@
+# 📂 Data files 폴더 및 내부 모든 파일 무시
+Data files/
+Data files/**
+
+# 📄 모든 .csv 파일 무시
+*.csv
