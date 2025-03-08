@@ -11,6 +11,9 @@ from tqdm import tqdm
 from torchdiffeq import odeint
 from torch.nn.utils.rnn import pad_sequence
 
+import torch.multiprocessing as mp
+import torch.distributed as dist
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_PATH = os.path.join(BASE_DIR, "..", "processed_data.parquet")
 CHECKPOINT_PATH = os.path.join(BASE_DIR, "checkpoint.pth")
@@ -21,9 +24,9 @@ LEARNING_RATE = 1e-3
 STATIC_INPUT_DIM = 7
 STATIC_HIDDEN_DIM = 16
 ODE_HIDDEN_DIM = 16
-MAX_FILES = 10
-MAX_ROWS = 0  # 0으로 설정 시 전체 CP 데이터 사용
-CP_SCALE = 1
+NUM_TRAINING_SAMPLES = 10000
+CP_SEQUENCE_LENGTH_LIMIT = 0
+CONCENTRATION_SCALE = 1
 
 
 class PKPDataset(Dataset):
@@ -31,20 +34,21 @@ class PKPDataset(Dataset):
         self,
         parquet_path=DATA_PATH,
         transform=None,
-        max_files=MAX_FILES,
-        max_rows=MAX_ROWS,
+        num_samples=NUM_TRAINING_SAMPLES,
+        cp_length_limit=CP_SEQUENCE_LENGTH_LIMIT,
     ):
         self.df = pd.read_parquet(parquet_path, engine="pyarrow")
-        if max_files is not None:
-            self.df = self.df.iloc[:max_files]
-        if max_rows == 0:
-            self.max_rows = self.df["CP_sequence"].apply(len).min()
-        elif max_rows is not None:
-            self.max_rows = max_rows
+        if num_samples is not None:
+            self.df = self.df.iloc[:num_samples]
+        if cp_length_limit == 0:
+            self.cp_length = self.df["CP_sequence"].apply(len).min()
+        elif cp_length_limit is not None:
+            self.cp_length = cp_length_limit
         else:
-            self.max_rows = None
+            self.cp_length = None
 
-        print(f"총 {self.max_rows}시간까지의 데이터로 학습을 진행합니다.")
+        if (not dist.is_initialized()) or (dist.get_rank() == 0):
+            print(f"총 {self.cp_length} 시간까지의 데이터로 학습을 진행합니다.")
 
         self.transform = transform
 
@@ -59,12 +63,16 @@ class PKPDataset(Dataset):
             .values
         )
         static_features = torch.tensor(static_features)
-        cp_sequence = np.array(row["CP_sequence"], dtype=np.float32) / CP_SCALE
-        if self.max_rows is not None:
-            cp_sequence = cp_sequence[: self.max_rows]
-        t_values = np.arange(0, len(cp_sequence), dtype=np.float32)
+        concentration_sequence = (
+            np.array(row["CP_sequence"], dtype=np.float32) / CONCENTRATION_SCALE
+        )
+        if self.cp_length is not None:
+            concentration_sequence = concentration_sequence[: self.cp_length]
+        t_values = np.arange(0, len(concentration_sequence), dtype=np.float32)
         t = torch.tensor(t_values)
-        cp = torch.tensor(cp_sequence, dtype=torch.float32).unsqueeze(1)
+        concentration = torch.tensor(
+            concentration_sequence, dtype=torch.float32
+        ).unsqueeze(1)
         amt = static_features[5].item()
         II = static_features[6].item()
         total_time = t[-1].item()
@@ -74,7 +82,7 @@ class PKPDataset(Dataset):
         sample = {
             "static_features": static_features,
             "t": t,
-            "cp": cp,
+            "concentration": concentration,
             "injection_times": injection_times,
             "injection_doses": injection_doses,
         }
@@ -85,10 +93,10 @@ class PKPDataset(Dataset):
 
 def collate_fn(batch):
     static_features = torch.stack([b["static_features"] for b in batch], dim=0)
-    cp_padded = pad_sequence(
-        [b["cp"] for b in batch], batch_first=True, padding_value=0.0
+    concentration_padded = pad_sequence(
+        [b["concentration"] for b in batch], batch_first=True, padding_value=0.0
     )
-    T_max = cp_padded.size(1)
+    T_max = concentration_padded.size(1)
     t = torch.arange(0, T_max, dtype=torch.float32)
     injection_times_padded = pad_sequence(
         [b["injection_times"] for b in batch], batch_first=True, padding_value=0.0
@@ -99,15 +107,15 @@ def collate_fn(batch):
     return {
         "static_features": static_features,
         "t": t,
-        "cp": cp_padded,
+        "concentration": concentration_padded,
         "injection_times": injection_times_padded,
         "injection_doses": injection_doses_padded,
     }
 
 
-class ODEF(nn.Module):
+class ODEFunction(nn.Module):
     def __init__(self, hidden_dim, static_dim, dose_dim=1):
-        super(ODEF, self).__init__()
+        super(ODEFunction, self).__init__()
         self.net = nn.Sequential(
             nn.Linear(hidden_dim + static_dim + dose_dim, 64),
             nn.Tanh(),
@@ -115,7 +123,7 @@ class ODEF(nn.Module):
         )
 
     def forward(
-        self, t, state, static_embed, injection_times, injection_doses, sigma=0.1
+        self, t, state, static_embed, injection_times, injection_doses, sigma=1.0
     ):
         dose = (
             injection_doses * torch.exp(-((t - injection_times) ** 2) / (2 * sigma**2))
@@ -137,7 +145,7 @@ class NeuralODEModel(nn.Module):
             nn.Linear(static_input_dim, static_hidden_dim), nn.ReLU()
         )
         self.initial_state_layer = nn.Linear(static_hidden_dim, ode_hidden_dim)
-        self.ode_func = ODEF(ode_hidden_dim, static_hidden_dim, dose_dim=1)
+        self.ode_func = ODEFunction(ode_hidden_dim, static_hidden_dim, dose_dim=1)
         self.readout = nn.Sequential(nn.Linear(ode_hidden_dim, 1), nn.ReLU())
 
     def forward(self, t, static_features, injection_times, injection_doses):
@@ -151,8 +159,8 @@ class NeuralODEModel(nn.Module):
 
         h_t = odeint(func, h0, t, method="dopri5", rtol=1e-5, atol=1e-6)
         h_t = h_t.transpose(0, 1)
-        cp_pred = self.readout(h_t)
-        return cp_pred
+        predicted_concentration = self.readout(h_t)
+        return predicted_concentration
 
 
 def run_inference(
@@ -171,19 +179,174 @@ def run_inference(
     )
     model.eval()
     with torch.no_grad():
-        cp_pred = model(t, static_features, injection_times, injection_doses)
-    cp_pred = cp_pred.squeeze().cpu().numpy()
-    pred_df = pd.DataFrame({"time": t.cpu().numpy(), "CP_pred": cp_pred})
-    pred_df.to_csv(os.path.join(BASE_DIR, "predicted_cp.csv"), index=False)
+        predicted_concentration = model(
+            t, static_features, injection_times, injection_doses
+        )
+    predicted_concentration = predicted_concentration.squeeze().cpu().numpy()
+    pred_df = pd.DataFrame(
+        {"time": t.cpu().numpy(), "predicted_concentration": predicted_concentration}
+    )
+    pred_df.to_csv(os.path.join(BASE_DIR, "predicted_concentration.csv"), index=False)
     plt.figure()
-    plt.plot(t.cpu().numpy(), cp_pred, marker=".")
+    plt.plot(t.cpu().numpy(), predicted_concentration, marker=".")
     plt.xlabel("Time")
-    plt.ylabel("CP")
-    plt.title("Predicted CP over Time")
-    plt.savefig(os.path.join(BASE_DIR, "predicted_cp.png"))
+    plt.ylabel("Concentration")
+    plt.title("Predicted Concentration over Time")
+    plt.savefig(os.path.join(BASE_DIR, "predicted_concentration.png"))
     plt.close()
-    print("Inference 완료: predicted_cp.csv, predicted_cp.png 생성됨.")
-    return cp_pred
+    print(
+        "Inference 완료: predicted_concentration.csv, predicted_concentration.png 생성됨."
+    )
+    return predicted_concentration
+
+
+def main_worker(gpu: int, world_size: int, args: object):
+    if world_size > 1:
+        os.environ["MASTER_ADDR"] = "127.0.0.1"
+        os.environ["MASTER_PORT"] = "29500"
+        dist.init_process_group("nccl", rank=gpu, world_size=world_size)
+    device = torch.device(f"cuda:{gpu}" if torch.cuda.is_available() else "cpu")
+    if gpu == 0:
+        print(f"선택한 모드: {args.mode}")
+
+    model = NeuralODEModel(
+        static_input_dim=STATIC_INPUT_DIM,
+        static_hidden_dim=STATIC_HIDDEN_DIM,
+        ode_hidden_dim=ODE_HIDDEN_DIM,
+    ).to(device)
+
+    checkpoint = None
+    start_epoch = 0
+    loss_history = []
+    if os.path.exists(CHECKPOINT_PATH):
+        checkpoint = torch.load(CHECKPOINT_PATH, map_location=device)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        start_epoch = checkpoint["epoch"] + 1
+        loss_history = checkpoint.get("loss_history", [])
+        if gpu == 0:
+            print(f"체크포인트 불러옴: epoch {start_epoch}부터 이어서 학습합니다.")
+
+    if world_size > 1:
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[gpu])
+
+    if args.mode == "train":
+        dataset = PKPDataset(
+            parquet_path=DATA_PATH,
+            num_samples=NUM_TRAINING_SAMPLES,
+            cp_length_limit=CP_SEQUENCE_LENGTH_LIMIT,
+        )
+        sampler = (
+            torch.utils.data.distributed.DistributedSampler(
+                dataset, num_replicas=world_size, rank=gpu
+            )
+            if world_size > 1
+            else None
+        )
+        dataloader = DataLoader(
+            dataset,
+            batch_size=BATCH_SIZE,
+            shuffle=(sampler is None),
+            sampler=sampler,
+            collate_fn=collate_fn,
+            num_workers=NUM_WORKERS,
+            pin_memory=PIN_MEMORY,
+        )
+        optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+        if checkpoint is not None and "optimizer_state_dict" in checkpoint:
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        num_epochs = args.num_epochs
+        criterion = nn.MSELoss()
+        for epoch in range(start_epoch, num_epochs):
+            if world_size > 1 and sampler is not None:
+                sampler.set_epoch(epoch)
+            model.train()
+            epoch_loss = 0.0
+            iterator = tqdm(
+                dataloader,
+                desc=f"Epoch {epoch}/{num_epochs}",
+                ncols=80,
+                disable=(gpu != 0),
+            )
+            for i, batch in enumerate(iterator, start=1):
+                static_features = batch["static_features"].to(device)
+                t = batch["t"].to(device).squeeze()
+                concentration_target = batch["concentration"].to(device)
+                injection_times = batch["injection_times"].to(device)
+                injection_doses = batch["injection_doses"].to(device)
+                optimizer.zero_grad()
+                predicted_concentration = model(
+                    t, static_features, injection_times, injection_doses
+                )
+                loss = criterion(predicted_concentration, concentration_target)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+                epoch_loss += loss.item()
+                if i % 100 == 0 and gpu == 0:
+                    print(
+                        f"Epoch {epoch}, Batch {i}/{len(dataloader)}: Current batch loss = {loss.item():.6f}",
+                        flush=True,
+                    )
+            epoch_loss /= len(dataloader)
+            if gpu == 0:
+                loss_history.append(epoch_loss)
+                print(f"Epoch {epoch}: Average Loss = {epoch_loss:.6f}", flush=True)
+                torch.save(
+                    {
+                        "epoch": epoch,
+                        "model_state_dict": (
+                            model.module.state_dict()
+                            if world_size > 1
+                            else model.state_dict()
+                        ),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "loss_history": loss_history,
+                    },
+                    CHECKPOINT_PATH,
+                )
+                loss_df = pd.DataFrame(
+                    {"epoch": list(range(len(loss_history))), "loss": loss_history}
+                )
+                loss_df.to_csv(os.path.join(BASE_DIR, "training_loss.csv"), index=False)
+                plt.figure()
+                plt.plot(loss_history, marker="o")
+                plt.yscale("log")
+                plt.xlabel("Epoch")
+                plt.ylabel("Loss (log scale)")
+                plt.title("Training Loss History")
+                plt.savefig(os.path.join(BASE_DIR, "training_loss.png"))
+                plt.close()
+        if gpu == 0:
+            loss_df = pd.DataFrame(
+                {"epoch": list(range(len(loss_history))), "loss": loss_history}
+            )
+            loss_df.to_csv(os.path.join(BASE_DIR, "training_loss.csv"), index=False)
+            print("학습 완료 및 loss 기록 저장됨.")
+    elif args.mode == "infer":
+        if gpu == 0:
+            static_input = input(
+                "BW, EGFR, SEX, RAAS, BPS, amt, II 값을 순서대로 입력하세요. (공백으로 구분, 예: 68.28 66.37 1 1 1 244 482): "
+            )
+            static_features = [float(x.strip()) for x in static_input.split()]
+            total_time = float(input("모델이 예측할 총 시간을 입력하세요. (시간): "))
+            amt = static_features[5]
+            II = static_features[6]
+            injection_times = np.arange(0, total_time + 1e-3, II, dtype=np.float32)
+            injection_doses = np.full(injection_times.shape, amt, dtype=np.float32)
+            run_inference(
+                model.module if world_size > 1 else model,
+                static_features,
+                injection_times,
+                injection_doses,
+                total_time,
+                device,
+            )
+    if world_size > 1:
+        dist.destroy_process_group()
+
+
+class Args:
+    pass
 
 
 if __name__ == "__main__":
@@ -196,109 +359,38 @@ if __name__ == "__main__":
         print("잘못된 입력입니다.")
         sys.exit(0)
 
-    class Args:
-        pass
-
     args = Args()
     args.mode = mode_input
-    print(f"선택한 모드: {args.mode}")
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = NeuralODEModel(
-        static_input_dim=STATIC_INPUT_DIM,
-        static_hidden_dim=STATIC_HIDDEN_DIM,
-        ode_hidden_dim=ODE_HIDDEN_DIM,
-    ).to(device)
-    checkpoint_path = CHECKPOINT_PATH
-    start_epoch = 0
-    loss_history = []
-
-    if os.path.exists(checkpoint_path):
-        checkpoint = torch.load(checkpoint_path, map_location=device)
-        model.load_state_dict(checkpoint["model_state_dict"])
-        start_epoch = checkpoint["epoch"] + 1
-        loss_history = checkpoint.get("loss_history", [])
-        print(f"체크포인트 불러옴: epoch {start_epoch}부터 이어서 학습합니다.")
-
-    if torch.cuda.is_available():
-        print(f"현재 사용 중인 GPU: {torch.cuda.get_device_name(0)}")
-        print(f"사용 중인 GPU 메모리: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
-        print(f"예약된 GPU 메모리: {torch.cuda.memory_reserved() / 1024**2:.2f} MB\n")
 
     if args.mode == "train":
-        dataset = PKPDataset(
-            parquet_path=DATA_PATH, max_files=MAX_FILES, max_rows=MAX_ROWS
-        )
-        dataloader = DataLoader(
-            dataset,
-            batch_size=BATCH_SIZE,
-            shuffle=True,
-            collate_fn=collate_fn,
-            num_workers=NUM_WORKERS,
-            pin_memory=PIN_MEMORY,
-        )
-        optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
-        num_epochs = int(
+        start_epoch = 0
+
+        if os.path.exists(CHECKPOINT_PATH):
+            checkpoint = torch.load(CHECKPOINT_PATH, map_location=torch.device("cpu"))
+            start_epoch = checkpoint["epoch"] + 1
+        args.num_epochs = int(
             input(
                 f"몇 epoch까지 학습할까요? (현재까지 학습된 epoch 수: {start_epoch}, 학습 중간에 코드가 멈추더라도, 각 epoch가 끝날 때마다 자동으로 저장됩니다.): "
             )
-            or 100
+            or 10000
         )
-        criterion = nn.MSELoss()
-        for epoch in range(start_epoch, num_epochs):
-            model.train()
-            epoch_loss = 0.0
-            iterator = tqdm(dataloader, desc=f"Epoch {epoch}/{num_epochs}", ncols=80)
 
-            for i, batch in enumerate(iterator, start=1):
-                static_features = batch["static_features"].to(device)
-                t = batch["t"].to(device).squeeze()
-                cp_target = batch["cp"].to(device)
-                injection_times = batch["injection_times"].to(device)
-                injection_doses = batch["injection_doses"].to(device)
-                optimizer.zero_grad()
-                cp_pred = model(t, static_features, injection_times, injection_doses)
-                loss = criterion(cp_pred, cp_target)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer.step()
-                epoch_loss += loss.item()
-                if i % 100 == 0:
-                    print(
-                        f"Epoch {epoch}, Batch {i}/{len(dataloader)}: Current batch loss = {loss.item():.6f}",
-                        flush=True,
-                    )
-            epoch_loss /= len(dataloader)
-            loss_history.append(epoch_loss)
-            print(f"Epoch {epoch}: Average Loss = {epoch_loss:.6f}", flush=True)
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "loss_history": loss_history,
-                },
-                checkpoint_path,
-            )
-            loss_df = pd.DataFrame(
-                {"epoch": list(range(len(loss_history))), "loss": loss_history}
-            )
-            loss_df.to_csv(os.path.join(BASE_DIR, "training_loss.csv"), index=False)
-            plt.figure()
-            plt.plot(loss_history, marker="o")
-            plt.yscale("log")
-            plt.xlabel("Epoch")
-            plt.ylabel("Loss (log scale)")
-            plt.title("Training Loss History")
-            plt.savefig(os.path.join(BASE_DIR, "training_loss.png"))
-            plt.close()
-        loss_df = pd.DataFrame(
-            {"epoch": list(range(len(loss_history))), "loss": loss_history}
-        )
-        loss_df.to_csv(os.path.join(BASE_DIR, "training_loss.csv"), index=False)
-        print("학습 완료 및 loss 기록 저장됨.")
+        if torch.cuda.device_count() > 1:
+            world_size = torch.cuda.device_count()
+            mp.spawn(main_worker, args=(world_size, args), nprocs=world_size)
+        else:
+            main_worker(0, 1, args)
 
     elif args.mode == "infer":
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model = NeuralODEModel(
+            static_input_dim=STATIC_INPUT_DIM,
+            static_hidden_dim=STATIC_HIDDEN_DIM,
+            ode_hidden_dim=ODE_HIDDEN_DIM,
+        ).to(device)
+        if os.path.exists(CHECKPOINT_PATH):
+            checkpoint = torch.load(CHECKPOINT_PATH, map_location=device)
+            model.load_state_dict(checkpoint["model_state_dict"])
         static_input = input(
             "BW, EGFR, SEX, RAAS, BPS, amt, II 값을 순서대로 입력하세요. (공백으로 구분, 예: 68.28 66.37 1 1 1 244 482): "
         )
