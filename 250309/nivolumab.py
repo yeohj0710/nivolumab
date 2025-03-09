@@ -10,20 +10,20 @@ import torch.optim as optim
 from tqdm import tqdm
 from torchdiffeq import odeint
 from torch.nn.utils.rnn import pad_sequence
-
 import torch.multiprocessing as mp
 import torch.distributed as dist
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_PATH = os.path.join(BASE_DIR, "..", "processed_data.parquet")
 CHECKPOINT_PATH = os.path.join(BASE_DIR, "checkpoint.pth")
-BATCH_SIZE = 128
+
+BATCH_SIZE = 2048
 NUM_WORKERS = 8
 PIN_MEMORY = True
 LEARNING_RATE = 1e-3
 STATIC_INPUT_DIM = 7
 STATIC_HIDDEN_DIM = 16
-ODE_HIDDEN_DIM = 16
+ODE_HIDDEN_DIM = 32
 NUM_TRAINING_SAMPLES = 10000
 CP_SEQUENCE_LENGTH_LIMIT = 0
 CONCENTRATION_SCALE = 1
@@ -40,8 +40,9 @@ class PKPDataset(Dataset):
         self.df = pd.read_parquet(parquet_path, engine="pyarrow")
         if num_samples is not None:
             self.df = self.df.iloc[:num_samples]
+
         if cp_length_limit == 0:
-            self.cp_length = self.df["CP_sequence"].apply(len).min()
+            self.cp_length = self.df["CP_sequence"].apply(len).max()
         elif cp_length_limit is not None:
             self.cp_length = cp_length_limit
         else:
@@ -66,6 +67,7 @@ class PKPDataset(Dataset):
         concentration_sequence = (
             np.array(row["CP_sequence"], dtype=np.float32) / CONCENTRATION_SCALE
         )
+
         if self.cp_length is not None:
             concentration_sequence = concentration_sequence[: self.cp_length]
         t_values = np.arange(0, len(concentration_sequence), dtype=np.float32)
@@ -219,7 +221,7 @@ def main_worker(gpu: int, world_size: int, args: object):
     start_epoch = 0
     loss_history = []
     if os.path.exists(CHECKPOINT_PATH):
-        checkpoint = torch.load(CHECKPOINT_PATH, map_location=device)
+        checkpoint = torch.load(CHECKPOINT_PATH, map_location=device, weights_only=True)
         model.load_state_dict(checkpoint["model_state_dict"])
         start_epoch = checkpoint["epoch"] + 1
         loss_history = checkpoint.get("loss_history", [])
@@ -254,16 +256,16 @@ def main_worker(gpu: int, world_size: int, args: object):
         optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
         if checkpoint is not None and "optimizer_state_dict" in checkpoint:
             optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        num_epochs = args.num_epochs
-        criterion = nn.MSELoss()
-        for epoch in range(start_epoch, num_epochs):
+
+        criterion = nn.MSELoss(reduction="none")
+        for epoch in range(start_epoch, args.num_epochs):
             if world_size > 1 and sampler is not None:
                 sampler.set_epoch(epoch)
             model.train()
             epoch_loss = 0.0
             iterator = tqdm(
                 dataloader,
-                desc=f"Epoch {epoch}/{num_epochs}",
+                desc=f"Epoch {epoch}/{args.num_epochs}",
                 ncols=80,
                 disable=(gpu != 0),
             )
@@ -277,7 +279,10 @@ def main_worker(gpu: int, world_size: int, args: object):
                 predicted_concentration = model(
                     t, static_features, injection_times, injection_doses
                 )
-                loss = criterion(predicted_concentration, concentration_target)
+                loss_all = criterion(predicted_concentration, concentration_target)
+
+                mask = (concentration_target != 0).float()
+                loss = (loss_all * mask).sum() / mask.sum()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
@@ -389,7 +394,9 @@ if __name__ == "__main__":
             ode_hidden_dim=ODE_HIDDEN_DIM,
         ).to(device)
         if os.path.exists(CHECKPOINT_PATH):
-            checkpoint = torch.load(CHECKPOINT_PATH, map_location=device)
+            checkpoint = torch.load(
+                CHECKPOINT_PATH, map_location=device, weights_only=True
+            )
             model.load_state_dict(checkpoint["model_state_dict"])
         static_input = input(
             "BW, EGFR, SEX, RAAS, BPS, amt, II 값을 순서대로 입력하세요. (공백으로 구분, 예: 68.28 66.37 1 1 1 244 482): "
