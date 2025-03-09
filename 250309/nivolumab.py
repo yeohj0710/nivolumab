@@ -28,8 +28,8 @@ NUM_TRAINING_SAMPLES = 10000
 CP_SEQUENCE_LENGTH_LIMIT = 0
 MIN_CP_LENGTH = 2000
 CONCENTRATION_SCALE = 1
-SCALING_FACTOR = 2.0
-ELIMINATION_FACTOR = 0.01
+SCALING_FACTOR = 1.0
+
 RTOL = 1e-5
 ATOL = 1e-6
 
@@ -47,7 +47,7 @@ class PKPDataset(Dataset):
             self.df = self.df.iloc[:num_samples]
 
         if cp_length_limit == 0:
-            # 최소 CP 시퀀스 길이 이상인 데이터만 사용
+
             self.df = self.df[self.df["CP_sequence"].apply(len) >= MIN_CP_LENGTH]
             self.cp_length = MIN_CP_LENGTH
             if (not dist.is_initialized()) or (dist.get_rank() == 0):
@@ -76,7 +76,6 @@ class PKPDataset(Dataset):
         concentration_sequence = (
             np.array(row["CP_sequence"], dtype=np.float32) / CONCENTRATION_SCALE
         )
-
         if self.cp_length is not None:
             concentration_sequence = concentration_sequence[: self.cp_length]
         t_values = np.arange(0, len(concentration_sequence), dtype=np.float32)
@@ -136,13 +135,13 @@ class ODEFunction(nn.Module):
     def forward(
         self, t, state, static_embed, injection_times, injection_doses, sigma=0.5
     ):
-        dose = SCALING_FACTOR * (
+        dose_effect = SCALING_FACTOR * (
             injection_doses * torch.exp(-((t - injection_times) ** 2) / (2 * sigma**2))
         ).sum(dim=1, keepdim=True)
-        dose = torch.clamp(dose, min=0.0, max=1e2)
-        elimination = -ELIMINATION_FACTOR * state
-        inp = torch.cat([state, static_embed, dose], dim=-1)
-        return self.net(inp) + elimination
+        dose_effect = torch.clamp(dose_effect, min=0.0, max=1e2)
+        inp = torch.cat([state, static_embed, dose_effect], dim=-1)
+
+        return self.net(inp)
 
 
 class NeuralODEModel(nn.Module):
@@ -158,7 +157,7 @@ class NeuralODEModel(nn.Module):
         )
         self.initial_state_layer = nn.Linear(static_hidden_dim, ode_hidden_dim)
         self.ode_func = ODEFunction(ode_hidden_dim, static_hidden_dim, dose_dim=1)
-        self.readout = nn.Sequential(nn.Linear(ode_hidden_dim, 1), nn.ReLU())
+        self.readout = nn.Sequential(nn.Linear(ode_hidden_dim, 1), nn.Softplus())
 
     def forward(self, t, static_features, injection_times, injection_doses):
         static_embed = self.static_encoder(static_features)
@@ -290,7 +289,6 @@ def main_worker(gpu: int, world_size: int, args: object):
                     t, static_features, injection_times, injection_doses
                 )
                 loss_all = criterion(predicted_concentration, concentration_target)
-
                 mask = (concentration_target != 0).float()
                 loss = (loss_all * mask).sum() / mask.sum()
                 loss.backward()
@@ -379,7 +377,6 @@ if __name__ == "__main__":
 
     if args.mode == "train":
         start_epoch = 0
-
         if os.path.exists(CHECKPOINT_PATH):
             checkpoint = torch.load(CHECKPOINT_PATH, map_location=torch.device("cpu"))
             start_epoch = checkpoint["epoch"] + 1
@@ -389,13 +386,11 @@ if __name__ == "__main__":
             )
             or 10000
         )
-
         if torch.cuda.device_count() > 1:
             world_size = torch.cuda.device_count()
             mp.spawn(main_worker, args=(world_size, args), nprocs=world_size)
         else:
             main_worker(0, 1, args)
-
     elif args.mode == "infer":
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         model = NeuralODEModel(
