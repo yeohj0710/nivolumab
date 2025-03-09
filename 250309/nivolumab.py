@@ -21,7 +21,7 @@ BATCH_SIZE = 128
 NUM_WORKERS = 8
 
 PIN_MEMORY = True
-LEARNING_RATE = 1e-3
+LEARNING_RATE = 2e-3
 STATIC_INPUT_DIM = 7
 STATIC_HIDDEN_DIM = 16
 ODE_HIDDEN_DIM = 16
@@ -136,7 +136,7 @@ class ODEFunction(nn.Module):
         )
 
     def forward(
-        self, t, state, static_embed, injection_times, injection_doses, sigma=1.0
+        self, t, state, static_embed, injection_times, injection_doses, sigma=0.1
     ):
         dose_effect = SCALING_FACTOR * (
             injection_doses * torch.exp(-((t - injection_times) ** 2) / (2 * sigma**2))
