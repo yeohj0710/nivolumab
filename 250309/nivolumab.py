@@ -17,16 +17,21 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_PATH = os.path.join(BASE_DIR, "..", "processed_data.parquet")
 CHECKPOINT_PATH = os.path.join(BASE_DIR, "checkpoint.pth")
 
-BATCH_SIZE = 2048
+BATCH_SIZE = 1024
 NUM_WORKERS = 8
 PIN_MEMORY = True
 LEARNING_RATE = 1e-3
 STATIC_INPUT_DIM = 7
 STATIC_HIDDEN_DIM = 16
-ODE_HIDDEN_DIM = 32
+ODE_HIDDEN_DIM = 16
 NUM_TRAINING_SAMPLES = 10000
 CP_SEQUENCE_LENGTH_LIMIT = 0
+MIN_CP_LENGTH = 2000
 CONCENTRATION_SCALE = 1
+SCALING_FACTOR = 2.0
+ELIMINATION_FACTOR = 0.01
+RTOL = 1e-5
+ATOL = 1e-6
 
 
 class PKPDataset(Dataset):
@@ -42,7 +47,11 @@ class PKPDataset(Dataset):
             self.df = self.df.iloc[:num_samples]
 
         if cp_length_limit == 0:
-            self.cp_length = self.df["CP_sequence"].apply(len).max()
+            # 최소 CP 시퀀스 길이 이상인 데이터만 사용
+            self.df = self.df[self.df["CP_sequence"].apply(len) >= MIN_CP_LENGTH]
+            self.cp_length = MIN_CP_LENGTH
+            if (not dist.is_initialized()) or (dist.get_rank() == 0):
+                print(f"최소 CP 시퀀스 길이를 만족하는 데이터 개수: {len(self.df)}")
         elif cp_length_limit is not None:
             self.cp_length = cp_length_limit
         else:
@@ -125,14 +134,15 @@ class ODEFunction(nn.Module):
         )
 
     def forward(
-        self, t, state, static_embed, injection_times, injection_doses, sigma=1.0
+        self, t, state, static_embed, injection_times, injection_doses, sigma=0.5
     ):
-        dose = (
+        dose = SCALING_FACTOR * (
             injection_doses * torch.exp(-((t - injection_times) ** 2) / (2 * sigma**2))
         ).sum(dim=1, keepdim=True)
         dose = torch.clamp(dose, min=0.0, max=1e2)
+        elimination = -ELIMINATION_FACTOR * state
         inp = torch.cat([state, static_embed, dose], dim=-1)
-        return self.net(inp)
+        return self.net(inp) + elimination
 
 
 class NeuralODEModel(nn.Module):
@@ -159,7 +169,7 @@ class NeuralODEModel(nn.Module):
                 t_val, h, static_embed, injection_times, injection_doses
             )
 
-        h_t = odeint(func, h0, t, method="dopri5", rtol=1e-5, atol=1e-6)
+        h_t = odeint(func, h0, t, method="dopri5", rtol=RTOL, atol=ATOL)
         h_t = h_t.transpose(0, 1)
         predicted_concentration = self.readout(h_t)
         return predicted_concentration
