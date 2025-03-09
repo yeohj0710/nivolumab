@@ -17,8 +17,8 @@ import torch.distributed as dist
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_PATH = os.path.join(BASE_DIR, "..", "processed_data.parquet")
 CHECKPOINT_PATH = os.path.join(BASE_DIR, "checkpoint.pth")
-BATCH_SIZE = 1024
-NUM_WORKERS = 16
+BATCH_SIZE = 128
+NUM_WORKERS = 8
 PIN_MEMORY = True
 LEARNING_RATE = 1e-3
 STATIC_INPUT_DIM = 7
