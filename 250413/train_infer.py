@@ -14,9 +14,9 @@ PARQUET_PATH = os.path.join(BASE_DIR, "../processed_data.parquet")
 BATCH_SIZE = 128
 NUM_EPOCHS = 10000
 LEARNING_RATE = 1e-4
-HIDDEN_SIZE = 256
-NUM_LAYERS = 2  # 예시로 2로 변경
-TEACHER_FORCING_RATIO = 0.5  # 예시값
+MODEL_DIM = 256  # Transformer 모델 차원
+NUM_LAYERS = 2  # Transformer Encoder 레이어 수
+NUM_HEADS = 4  # multi-head attention 헤드 수
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -77,13 +77,13 @@ class TimeSeriesDataset(Dataset):
         self.dataframes = dataframes
         self.mean_sr = mean_sr
         self.std_sr = std_sr
-        self.data_column = mean_sr.index
+        self.data_column = mean_sr.index  # [BW, EGFR, SEX, RAAS, BPS, amt, CP, II]
 
     def __len__(self):
         return len(self.dataframes)
 
     def __getitem__(self, idx):
-        # shape: (seq_len, len(self.data_column)) => (seq_len, 8) (BW, EGFR, ..., CP, time 등)
+        # 정규화된 DataFrame, shape: (seq_len, 8)
         return (self.dataframes[idx][self.data_column] - self.mean_sr) / self.std_sr
 
 
@@ -91,17 +91,15 @@ def collate_fn(batch):
     lengths = [len(seq) for seq in batch]
     max_len = max(lengths)
 
-    # (batch, max_len, 7) 이 될 텐데, 여기서는 time 제외 7개만 사용(기존 예시 코드와 동일하게)
+    # 여기서는 time 제외 7개 특성 [CP, BW, EGFR, SEX, RAAS, BPS, amt] 사용
     padded_batch_input = np.zeros((len(batch), max_len, 7), dtype=np.float32)
-    # 라벨 (batch, max_len, 1)
+    # 라벨 (batch, max_len, 1) : 정답 CP 값
     padded_batch_label = np.zeros((len(batch), max_len, 1), dtype=np.float32)
     mask = np.zeros((len(batch), max_len, 1), dtype=np.float32)
 
     for idx, seq in enumerate(batch):
         cur_len = lengths[idx]
-        # seq.columns: [BW, EGFR, SEX, RAAS, BPS, amt, CP, II] (정규화된 상태)
-        # 여기서는 CP를 첫 번째 컬럼, 나머지 특성 6개를 두 번째~ 로 맞추고 싶다면 순서를 맞춰야 함
-        # 예: 아래처럼 CP를 맨 앞, 그 다음 BW...amt 순으로
+        # seq.columns: [BW, EGFR, SEX, RAAS, BPS, amt, CP, II]
         cp = seq["CP"].values
         bw = seq["BW"].values
         egfr = seq["EGFR"].values
@@ -109,11 +107,9 @@ def collate_fn(batch):
         raas = seq["RAAS"].values
         bps = seq["BPS"].values
         amt = seq["amt"].values
-        # time, II 등은 여기서는 사용하지 않음(필요하면 포함 가능)
 
-        # padded_batch_input의 첫 번째 컬럼: CP
+        # 입력의 첫 컬럼은 CP, 이후 6개 특성: BW, EGFR, SEX, RAAS, BPS, amt
         padded_batch_input[idx, :cur_len, 0] = cp
-        # 이후 6개 컬럼: BW, EGFR, SEX, RAAS, BPS, amt
         padded_batch_input[idx, :cur_len, 1] = bw
         padded_batch_input[idx, :cur_len, 2] = egfr
         padded_batch_input[idx, :cur_len, 3] = sex
@@ -121,10 +117,9 @@ def collate_fn(batch):
         padded_batch_input[idx, :cur_len, 5] = bps
         padded_batch_input[idx, :cur_len, 6] = amt
 
-        # 라벨은 CP 그대로(동일 길이)
+        # 라벨은 CP 값 (전체 시퀀스)
         padded_batch_label[idx, :cur_len, 0] = cp
 
-        # 유효 길이 부분을 1로
         mask[idx, :cur_len, 0] = 1
 
     return (
@@ -135,95 +130,76 @@ def collate_fn(batch):
     )
 
 
-###################################
-# 위까지는 기존 코드(또는 유사) 유지
-###################################
+##############################################
+# Sinusoidal positional encoding (파라미터 없는 위치 임베딩)
+##############################################
+def get_sinusoidal_pos_encoding(seq_len: int, model_dim: int, device: torch.device):
+    pos = torch.arange(seq_len, dtype=torch.float, device=device).unsqueeze(
+        1
+    )  # (seq_len, 1)
+    i = torch.arange(model_dim, dtype=torch.float, device=device).unsqueeze(
+        0
+    )  # (1, model_dim)
+    angle_rates = 1 / torch.pow(10000, (2 * (i // 2)) / model_dim)
+    angle_rads = pos * angle_rates
+    # sin for even indices; cos for odd indices
+    pos_encoding = torch.zeros((seq_len, model_dim), device=device)
+    pos_encoding[:, 0::2] = torch.sin(angle_rads[:, 0::2])
+    pos_encoding[:, 1::2] = torch.cos(angle_rads[:, 1::2])
+    return pos_encoding  # (seq_len, model_dim)
 
 
-# (1) Encoder/Decoder/Seq2Seq 구현부
-class EncoderRNN(nn.Module):
-    def __init__(self, input_size: int, hidden_size: int, num_layers: int):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
-
-    def forward(self, encoder_inputs: torch.Tensor, lengths: torch.Tensor):
-        outputs, (hidden, cell) = self.lstm(encoder_inputs)
-        return hidden, cell
-
-
-class DecoderRNN(nn.Module):
-    def __init__(self, input_size: int, hidden_size: int, num_layers: int):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
-        self.fc_out = nn.Linear(hidden_size, 1)
-
-    def forward(self, decoder_input, hidden, cell):
-        output, (hidden, cell) = self.lstm(decoder_input, (hidden, cell))
-        pred = self.fc_out(output)
-        return pred, hidden, cell
-
-
-class Seq2Seq(nn.Module):
+##############################################
+# Transformer 기반 CP(t) 예측 모델 (Non-Autoregressive)
+##############################################
+class TransformerPredictor(nn.Module):
     def __init__(
         self,
-        encoder_input_size,
-        decoder_input_size,
-        hidden_size,
-        num_layers,
-        teacher_forcing_ratio=0.5,
+        input_dim: int,
+        model_dim: int,
+        num_layers: int,
+        nhead: int = 4,
+        dropout: float = 0.1,
     ):
+        """
+        input_dim: 입력 특성 차원 (여기서는 7)
+        model_dim: Transformer 모델 차원 (예: 256)
+        num_layers: Transformer Encoder 레이어 수
+        nhead: multi-head attention 헤드 수
+        dropout: dropout 확률
+        """
         super().__init__()
-        self.encoder = EncoderRNN(encoder_input_size, hidden_size, num_layers)
-        self.decoder = DecoderRNN(decoder_input_size, hidden_size, num_layers)
-        self.teacher_forcing_ratio = teacher_forcing_ratio
+        self.input_dim = input_dim
+        self.model_dim = model_dim
+        self.input_embed = nn.Linear(input_dim, model_dim)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=model_dim, nhead=nhead, dropout=dropout, batch_first=True
+        )
+        self.transformer_encoder = nn.TransformerEncoder(
+            encoder_layer, num_layers=num_layers
+        )
+        self.fc_out = nn.Linear(model_dim, 1)
 
-    def forward(self, padded_batch_input, lengths):
+    def forward(self, x):
         """
-        padded_batch_input: (batch, max_len, 7)
-          - [:, :, 0] : CP(t)
-          - [:, :, 1:] : BW, EGFR, SEX, RAAS, BPS, amt
-        lengths: (batch,)
+        x: (batch, seq_len, input_dim)
         """
-        batch_size, max_len, _ = padded_batch_input.size()
-
-        # (1) Encoder: CP 제외 6개 특성만 사용(필요 시 CP 포함 가능)
-        encoder_inputs = padded_batch_input[:, :, 1:]  # shape (batch, max_len, 6)
-        hidden, cell = self.encoder(encoder_inputs, lengths)
-
-        # (2) Decoder
-        outputs = torch.zeros(batch_size, max_len, 1, device=padded_batch_input.device)
-
-        # 첫 시점 입력: CP(0) + 6개 특성(0시점)
-        dec_in = padded_batch_input[:, 0, :]  # (batch, 7)
-        dec_in = dec_in.unsqueeze(1)  # (batch, 1, 7)
-
-        for t in range(max_len):
-            pred, hidden, cell = self.decoder(dec_in, hidden, cell)
-            # pred: (batch, 1, 1)
-            outputs[:, t, :] = pred.squeeze(1)
-
-            if t < max_len - 1:
-                use_teacher_forcing = torch.rand(1).item() < self.teacher_forcing_ratio
-                if use_teacher_forcing:
-                    # 다음 시점 CP는 GT
-                    next_cp = padded_batch_input[:, t + 1, 0].unsqueeze(1)
-                else:
-                    # 모델 예측
-                    next_cp = pred.squeeze(2)  # (batch, 1)
-
-                # 다음 시점 static 특성
-                next_features = padded_batch_input[:, t + 1, 1:]  # (batch, 6)
-                dec_in = torch.cat([next_cp, next_features], dim=1).unsqueeze(1)
-        return outputs
+        batch_size, seq_len, _ = x.size()
+        # 임베딩
+        x = self.input_embed(x)  # (batch, seq_len, model_dim)
+        # Sinusoidal positional encoding (seq_len, model_dim)
+        pos_enc = get_sinusoidal_pos_encoding(seq_len, self.model_dim, x.device)
+        # pos_enc 확장 후 합산
+        pos_enc = pos_enc.unsqueeze(0).expand(batch_size, -1, -1)
+        x = x + pos_enc
+        encoded = self.transformer_encoder(x)  # (batch, seq_len, model_dim)
+        out = self.fc_out(encoded)  # (batch, seq_len, 1)
+        return out
 
 
-###################################################
-# (2) 학습 및 추론(Train / Infer) 로직
-###################################################
+##############################################
+# 학습 및 추론 (Train / Infer) 로직
+##############################################
 mode = input("모드를 입력하세요. (훈련: t, 모델 실행: i): ").strip().lower()
 
 if mode in ["t", "train"]:
@@ -246,20 +222,21 @@ if mode in ["t", "train"]:
         num_workers=8,
     )
 
-    # Seq2Seq 모델 생성
-    # encoder_input_size = 6 (CP 제외) / decoder_input_size = 7 (이전 CP + 6개 특성)
-    model = Seq2Seq(
-        encoder_input_size=6,
-        decoder_input_size=7,
-        hidden_size=HIDDEN_SIZE,
+    # Transformer 기반 모델 생성
+    # 입력 특성 차원: 7, 모델 차원: MODEL_DIM, 레이어 수: NUM_LAYERS, nhead: NUM_HEADS
+    model = TransformerPredictor(
+        input_dim=7,
+        model_dim=MODEL_DIM,
         num_layers=NUM_LAYERS,
-        teacher_forcing_ratio=TEACHER_FORCING_RATIO,
-    ).to(device)
+        nhead=NUM_HEADS,
+        dropout=0.1,
+    )
+    model.to(device)
 
     criterion = nn.MSELoss(reduction="none")
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
-    checkpoint_path = os.path.join(BASE_DIR, "model_seq2seq.pth")
+    checkpoint_path = os.path.join(BASE_DIR, "model_transformer.pth")
     start_epoch = 0
     if os.path.exists(checkpoint_path):
         checkpoint = torch.load(checkpoint_path)
@@ -280,7 +257,7 @@ if mode in ["t", "train"]:
             mask = mask.to(device)
 
             optimizer.zero_grad()
-            outputs = model(padded_batch_input, lengths)
+            outputs = model(padded_batch_input)  # (batch, seq_len, 1)
             loss = criterion(outputs, padded_batch_label)
             masked_loss = (loss * mask).sum() / mask.sum()
             masked_loss.backward()
@@ -292,7 +269,6 @@ if mode in ["t", "train"]:
             f"Epoch [{epoch}/{NUM_EPOCHS}] | Loss: {total_loss/len(dataloader):.4f} | Time: {epoch_end - epoch_start:.2f}s"
         )
 
-        # 체크포인트 저장
         if epoch % 10 == 0:
             torch.save(
                 {
@@ -305,7 +281,7 @@ if mode in ["t", "train"]:
             print(f"Model saved at epoch {epoch}")
 
 elif mode in ["i", "infer"]:
-    model_path = os.path.join(BASE_DIR, "model_seq2seq.pth")
+    model_path = os.path.join(BASE_DIR, "model_transformer.pth")
     if not os.path.exists(model_path):
         print("모델 체크포인트가 없습니다. 먼저 학습을 진행하세요.")
         sys.exit(0)
@@ -321,12 +297,12 @@ elif mode in ["i", "infer"]:
 
     checkpoint = torch.load(model_path)
     print(f"Checkpoint loaded from epoch {checkpoint['epoch']}")
-    model = Seq2Seq(
-        encoder_input_size=6,
-        decoder_input_size=7,
-        hidden_size=HIDDEN_SIZE,
+    model = TransformerPredictor(
+        input_dim=7,
+        model_dim=MODEL_DIM,
         num_layers=NUM_LAYERS,
-        teacher_forcing_ratio=0.0,  # 추론 시 teacher forcing은 보통 0으로 둠
+        nhead=NUM_HEADS,
+        dropout=0.1,
     )
     model.load_state_dict(checkpoint["model_state_dict"])
     model.to(device)
@@ -345,12 +321,11 @@ elif mode in ["i", "infer"]:
             padded_batch_label = padded_batch_label.to(device)
             mask = mask.to(device)
 
-            outputs = model(padded_batch_input, lengths)  # (batch, max_len, 1)
+            outputs = model(padded_batch_input)  # (batch, seq_len, 1)
             loss = criterion(outputs, padded_batch_label)
             total_test_loss += (loss * mask).sum().item()
             total_count += mask.sum().item()
 
-            # numpy로 변환
             outputs_np = outputs.cpu().numpy()
             labels_np = padded_batch_label.cpu().numpy()
             lengths_np = lengths.cpu().numpy()
@@ -362,7 +337,6 @@ elif mode in ["i", "infer"]:
     test_loss = total_test_loss / total_count
     print(f"Test Loss: {test_loss:.4f}")
 
-    # 임의 그래프 출력
     sample_idx = int(input("그래프를 비교할 데이터의 번호를 입력하세요 (1~2000): ")) - 1
     if sample_idx < 0 or sample_idx >= len(predictions_per_sample):
         sample_idx = 0
