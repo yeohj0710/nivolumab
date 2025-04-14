@@ -15,7 +15,7 @@ from tqdm import tqdm
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PARQUET_PATH = os.path.join(BASE_DIR, "../processed_data.parquet")
 BATCH_SIZE = 128
-NUM_EPOCHS = 10000
+NUM_EPOCHS = 100000
 LEARNING_RATE = 1e-4
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
