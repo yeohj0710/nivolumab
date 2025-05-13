@@ -16,9 +16,9 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PARQUET_PATH = os.path.join(BASE_DIR, "../processed_data.parquet")
 BATCH_SIZE = 128
 NUM_EPOCHS = 100000
-LEARNING_RATE = 1e-4
+LEARNING_RATE = 1e-6
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")  # cuda or cuda:1
 
 # loss를 텍스트 파일에 저장할 경로
 loss_log_path = os.path.join(BASE_DIR, "loss_log.txt")
